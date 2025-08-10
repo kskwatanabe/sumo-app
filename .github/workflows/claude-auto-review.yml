@@ -1,4 +1,4 @@
-name: Claude AI Code Review
+name: Claude AI Auto Review & Merge
 
 on:
   pull_request:
@@ -6,10 +6,11 @@ on:
     branches: [main]
 
 jobs:
-  # 既存のテストジョブ
   test:
     runs-on: ubuntu-latest
     name: Run Tests
+    outputs:
+      test-status: ${{ steps.test-result.outputs.status }}
     steps:
       - uses: actions/checkout@v4
       
@@ -22,20 +23,30 @@ jobs:
       - name: Install dependencies
         run: npm ci
       
-      - name: Run tests
-        run: npm test
+      - name: Run tests with detailed output
+        id: test-result
+        run: |
+          echo "Running comprehensive test suite..."
+          if npm test; then
+            echo "✅ All tests passed successfully"
+            echo "status=passed" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Tests failed - see output above"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
 
-  # Claude AIレビュージョブ
-  claude-review:
+  claude-review-and-merge:
     runs-on: ubuntu-latest
-    name: Claude AI Review
-    needs: test  # テスト成功後に実行
-    if: github.event_name == 'pull_request'
+    name: Claude AI Review & Auto Merge
+    needs: test
+    if: github.event_name == 'pull_request' && needs.test.outputs.test-status == 'passed'
     
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 全履歴を取得してdiffを正確に
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get changed files
         id: changed-files
@@ -49,176 +60,236 @@ jobs:
             **/*.json
             **/*.md
 
-      - name: Setup Node.js for review script
+      - name: Setup Node.js for review
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install review dependencies
         run: |
-          npm install @anthropic-ai/sdk node-fetch@3
+          npm init -y
+          npm install @anthropic-ai/sdk
 
-      - name: Run Claude AI Review
+      - name: Create HTTP utility module
+        run: |
+          echo "const https = require('https');" > http-utils.js
+          echo "" >> http-utils.js
+          echo "function httpRequest(url, options = {}) {" >> http-utils.js
+          echo "  return new Promise((resolve, reject) => {" >> http-utils.js
+          echo "    const urlObj = new URL(url);" >> http-utils.js
+          echo "    const req = https.request({" >> http-utils.js
+          echo "      hostname: urlObj.hostname," >> http-utils.js
+          echo "      port: 443," >> http-utils.js
+          echo "      path: urlObj.pathname + urlObj.search," >> http-utils.js
+          echo "      method: options.method || 'GET'," >> http-utils.js
+          echo "      headers: { 'User-Agent': 'claude-bot', ...options.headers }," >> http-utils.js
+          echo "      timeout: 30000" >> http-utils.js
+          echo "    }, (res) => {" >> http-utils.js
+          echo "      let data = '';" >> http-utils.js
+          echo "      res.on('data', chunk => data += chunk);" >> http-utils.js
+          echo "      res.on('end', () => {" >> http-utils.js
+          echo "        try {" >> http-utils.js
+          echo "          resolve(res.statusCode < 300 ? JSON.parse(data) : Promise.reject(new Error(data)));" >> http-utils.js
+          echo "        } catch(e) { reject(e); }" >> http-utils.js
+          echo "      });" >> http-utils.js
+          echo "    });" >> http-utils.js
+          echo "    req.on('error', reject);" >> http-utils.js
+          echo "    if (options.body) req.write(options.body);" >> http-utils.js
+          echo "    req.end();" >> http-utils.js
+          echo "  });" >> http-utils.js
+          echo "}" >> http-utils.js
+          echo "" >> http-utils.js
+          echo "module.exports = { httpRequest };" >> http-utils.js
+
+      - name: Create main review script
+        run: |
+          echo "const Anthropic = require('@anthropic-ai/sdk');" > claude-review.js
+          echo "const { execSync } = require('child_process');" >> claude-review.js
+          echo "const { httpRequest } = require('./http-utils');" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "async function review() {" >> claude-review.js
+          echo "  try {" >> claude-review.js
+          echo "    console.log('🚀 Starting Claude 4 Sonnet review with auto-approval...');" >> claude-review.js
+          echo "    " >> claude-review.js
+          echo "    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });" >> claude-review.js
+          echo "    const files = (process.env.CHANGED_FILES || '').split(' ').filter(Boolean);" >> claude-review.js
+          echo "    " >> claude-review.js
+          echo "    console.log('📁 Changed files:', files.length);" >> claude-review.js
+          echo "    " >> claude-review.js
+          echo "    if (files.length === 0) {" >> claude-review.js
+          echo "      console.log('ℹ️ No files changed - auto approving');" >> claude-review.js
+          echo "      await postReview('APPROVE', '## 🤖 Claude 4 Sonnet AIレビュー\\\\n\\\\n**結果**: 変更対象ファイルなし\\\\n\\\\n**判定**: APPROVE（自動承認）');" >> claude-review.js
+          echo "      await mergeIfPossible();" >> claude-review.js
+          echo "      return;" >> claude-review.js
+          echo "    }" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "    let diff;" >> claude-review.js
+          echo "    try {" >> claude-review.js
+          echo "      diff = execSync('git diff origin/main...HEAD', { encoding: 'utf8', maxBuffer: 1024*1024 });" >> claude-review.js
+          echo "    } catch(e) {" >> claude-review.js
+          echo "      diff = 'Git diff error: ' + e.message;" >> claude-review.js
+          echo "    }" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "    const maxSize = 6000;" >> claude-review.js
+          echo "    const truncatedDiff = diff.length > maxSize ? diff.substring(0, maxSize) + '\\\\n[...truncated...]' : diff;" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "    console.log('📊 Diff size:', diff.length, 'chars (sending', truncatedDiff.length, ')');" >> claude-review.js
+
+      - name: Add PR data fetching to review script
+        run: |
+          echo "" >> claude-review.js
+          echo "    const prData = await httpRequest(\`https://api.github.com/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/pulls/\${process.env.PR_NUMBER}\`, {" >> claude-review.js
+          echo "      headers: {" >> claude-review.js
+          echo "        'Authorization': \`token \${process.env.GITHUB_TOKEN}\`," >> claude-review.js
+          echo "        'Accept': 'application/vnd.github.v3+json'" >> claude-review.js
+          echo "      }" >> claude-review.js
+          echo "    });" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "    console.log('✅ PR data:', prData.title || 'No title');" >> claude-review.js
+
+      - name: Add Claude AI review logic
+        run: |
+          echo "" >> claude-review.js
+          echo "    const promptText = \`# 大相撲アプリ コードレビュー (Claude 4 Sonnet)" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "あなたは経験豊富なシニアエンジニアです。Claude 4 Sonnetの最新能力を活用して、以下のPRを徹底的にレビューしてください。" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "## PR情報" >> claude-review.js
+          echo "- タイトル: \${prData.title || 'No title'}" >> claude-review.js
+          echo "- 説明: \${prData.body || '説明なし'}" >> claude-review.js
+          echo "- 変更ファイル数: \${files.length}" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "## 変更内容" >> claude-review.js
+          echo "\\\`\\\`\\\`diff" >> claude-review.js
+          echo "\${truncatedDiff}" >> claude-review.js
+          echo "\\\`\\\`\\\`" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "## 判定基準" >> claude-review.js
+          echo "- **APPROVE**: 全ての品質基準を満たし、軽微な改善提案のみ" >> claude-review.js
+          echo "- **REQUEST_CHANGES**: 品質・セキュリティ・機能に修正必須の問題あり" >> claude-review.js
+          echo "- **COMMENT**: 設計の根本的な見直しや大規模な改善提案" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "## 出力形式" >> claude-review.js
+          echo "最初の行に必ず: **DECISION: [APPROVE/REQUEST_CHANGES/COMMENT]**" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "Claude 4 Sonnetの高度な分析能力を活用し、建設的で実用的なレビューを提供してください。\`;" >> claude-review.js
+
+      - name: Add Claude API call and decision logic
+        run: |
+          echo "" >> claude-review.js
+          echo "    console.log('🤖 Requesting Claude 4 Sonnet review...');" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "    const response = await anthropic.messages.create({" >> claude-review.js
+          echo "      model: 'claude-sonnet-4-20250514'," >> claude-review.js
+          echo "      max_tokens: 3000," >> claude-review.js
+          echo "      messages: [{ role: 'user', content: promptText }]" >> claude-review.js
+          echo "    });" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "    const reviewText = response.content[0].text;" >> claude-review.js
+          echo "    const decisionLine = reviewText.split('\\\\n').find(line => line.includes('DECISION:')) || reviewText.split('\\\\n')[0];" >> claude-review.js
+          echo "    " >> claude-review.js
+          echo "    let decision = 'COMMENT';" >> claude-review.js
+          echo "    if (decisionLine.includes('APPROVE')) decision = 'APPROVE';" >> claude-review.js
+          echo "    else if (decisionLine.includes('REQUEST_CHANGES')) decision = 'REQUEST_CHANGES';" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "    console.log('📋 Claude 4 Sonnet decision:', decision);" >> claude-review.js
+
+      - name: Add review posting and merging logic
+        run: |
+          echo "" >> claude-review.js
+          echo "    const commentText = \`## 🤖 Claude 4 Sonnet AIレビュー" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "\${reviewText}" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "---" >> claude-review.js
+          echo "### 📊 レビュー情報" >> claude-review.js
+          echo "- **AI モデル**: Claude 4 Sonnet (最新)" >> claude-review.js
+          echo "- **判定**: \${decision}" >> claude-review.js
+          echo "- **実行時刻**: \${new Date().toISOString()}" >> claude-review.js
+          echo "- **変更ファイル数**: \${files.length}" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "*Claude 4 Sonnetによる最新AI自動レビュー*\`;" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "    if (decision === 'APPROVE') {" >> claude-review.js
+          echo "      console.log('✅ Approving PR automatically');" >> claude-review.js
+          echo "      await postReview('APPROVE', commentText);" >> claude-review.js
+          echo "      await mergeIfPossible();" >> claude-review.js
+          echo "    } else if (decision === 'REQUEST_CHANGES') {" >> claude-review.js
+          echo "      console.log('❌ Requesting changes');" >> claude-review.js
+          echo "      await postReview('REQUEST_CHANGES', commentText);" >> claude-review.js
+          echo "    } else {" >> claude-review.js
+          echo "      console.log('💬 Posting comment for human review');" >> claude-review.js
+          echo "      await postReview('COMMENT', commentText);" >> claude-review.js
+          echo "    }" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "    console.log('✅ Claude 4 Sonnet review completed');" >> claude-review.js
+
+      - name: Add helper functions and error handling
+        run: |
+          echo "  } catch (error) {" >> claude-review.js
+          echo "    console.error('❌ Error:', error.message);" >> claude-review.js
+          echo "    try {" >> claude-review.js
+          echo "      await postReview('REQUEST_CHANGES', \`## 🤖 Claude 4 Sonnet AIレビュー - エラー\\\\n\\\\nレビュー中にエラーが発生: \\\`\${error.message}\\\`\\\\n\\\\n**対応**: 手動レビューをお願いします。\`);" >> claude-review.js
+          echo "    } catch (e) {" >> claude-review.js
+          echo "      console.error('Failed to post error review:', e);" >> claude-review.js
+          echo "    }" >> claude-review.js
+          echo "    process.exit(1);" >> claude-review.js
+          echo "  }" >> claude-review.js
+          echo "}" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "async function postReview(event, body) {" >> claude-review.js
+          echo "  await httpRequest(\`https://api.github.com/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/pulls/\${process.env.PR_NUMBER}/reviews\`, {" >> claude-review.js
+          echo "    method: 'POST'," >> claude-review.js
+          echo "    headers: {" >> claude-review.js
+          echo "      'Authorization': \`token \${process.env.GITHUB_TOKEN}\`," >> claude-review.js
+          echo "      'Accept': 'application/vnd.github.v3+json'," >> claude-review.js
+          echo "      'Content-Type': 'application/json'" >> claude-review.js
+          echo "    }," >> claude-review.js
+          echo "    body: JSON.stringify({ event: event, body: body })" >> claude-review.js
+          echo "  });" >> claude-review.js
+          echo "}" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "async function mergeIfPossible() {" >> claude-review.js
+          echo "  try {" >> claude-review.js
+          echo "    console.log('🔄 Attempting to merge PR...');" >> claude-review.js
+          echo "    await httpRequest(\`https://api.github.com/repos/\${process.env.REPO_OWNER}/\${process.env.REPO_NAME}/pulls/\${process.env.PR_NUMBER}/merge\`, {" >> claude-review.js
+          echo "      method: 'PUT'," >> claude-review.js
+          echo "      headers: {" >> claude-review.js
+          echo "        'Authorization': \`token \${process.env.GITHUB_TOKEN}\`," >> claude-review.js
+          echo "        'Accept': 'application/vnd.github.v3+json'," >> claude-review.js
+          echo "        'Content-Type': 'application/json'" >> claude-review.js
+          echo "      }," >> claude-review.js
+          echo "      body: JSON.stringify({" >> claude-review.js
+          echo "        commit_title: '🤖 Auto-merge: Claude 4 Sonnet approved'," >> claude-review.js
+          echo "        commit_message: 'Automatically merged after Claude 4 Sonnet approval'," >> claude-review.js
+          echo "        merge_method: 'squash'" >> claude-review.js
+          echo "      })" >> claude-review.js
+          echo "    });" >> claude-review.js
+          echo "    console.log('🎉 PR merged successfully!');" >> claude-review.js
+          echo "  } catch (error) {" >> claude-review.js
+          echo "    console.log('ℹ️ Could not auto-merge (likely due to branch protection):', error.message);" >> claude-review.js
+          echo "  }" >> claude-review.js
+          echo "}" >> claude-review.js
+          echo "" >> claude-review.js
+          echo "review();" >> claude-review.js
+
+      - name: Execute Claude 4 Sonnet Review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
+          CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
         run: |
-          cat > claude-review.js << 'EOF'
-          const Anthropic = require('@anthropic-ai/sdk');
-          const { execSync } = require('child_process');
-          const fetch = require('node-fetch');
-
-          async function runClaudeReview() {
-            const anthropic = new Anthropic({
-              apiKey: process.env.ANTHROPIC_API_KEY,
-            });
-
-            // 変更されたファイルの差分を取得
-            const changedFiles = process.env.CHANGED_FILES?.split(' ') || [];
-            
-            if (changedFiles.length === 0) {
-              console.log('No relevant files changed');
-              return;
-            }
-
-            // Git diffを取得
-            const gitDiff = execSync('git diff origin/main...HEAD', { encoding: 'utf8' });
-            
-            // PRの情報を取得
-            const prResponse = await fetch(
-              `https://api.github.com/repos/${process.env.REPO_OWNER}/${process.env.REPO_NAME}/pulls/${process.env.PR_NUMBER}`,
-              {
-                headers: {
-                  'Authorization': `token ${process.env.GITHUB_TOKEN}`,
-                  'Accept': 'application/vnd.github.v3+json',
-                },
-              }
-            );
-            const prData = await prResponse.json();
-
-            // Claude にレビューを依頼
-            const reviewPrompt = `
-            # コードレビュー依頼
-
-            以下のプルリクエストをレビューしてください。
-
-            ## PR情報
-            - タイトル: ${prData.title}
-            - 説明: ${prData.body || '説明なし'}
-
-            ## 変更内容（Git Diff）
-            \`\`\`diff
-            ${gitDiff}
-            \`\`\`
-
-            ## レビュー観点
-            以下の観点でレビューしてください：
-
-            1. **コード品質**
-               - TypeScript型安全性
-               - エラーハンドリング
-               - パフォーマンス
-               - 可読性・保守性
-
-            2. **アーキテクチャ**
-               - 設計パターンの適用
-               - 責務分離
-               - 拡張性
-
-            3. **テスト**
-               - テストカバレッジ
-               - テストケースの妥当性
-               - エッジケースの考慮
-
-            4. **セキュリティ**
-               - 脆弱性の有無
-               - 入力値検証
-               - 認証・認可
-
-            5. **大相撲アプリ固有**
-               - 力士データの整合性
-               - 番付表示の正確性
-               - 相撲用語の適切な使用
-
-            ## 出力形式
-            以下の形式でレビューコメントを作成してください：
-
-            ### 🎯 総合評価
-            [APPROVE/REQUEST_CHANGES/COMMENT]
-
-            ### ✅ 良い点
-            - [良い実装や改善点を具体的に]
-
-            ### ⚠️ 改善提案
-            - [改善すべき点を具体的に、コード例付きで]
-
-            ### 🐛 潜在的な問題
-            - [バグや脆弱性の可能性があれば]
-
-            ### 📚 学習・参考リソース
-            - [関連するベストプラクティスや参考資料があれば]
-
-            レビューは建設的で、具体的な改善案を含めてください。
-            `;
-
-            try {
-              const response = await anthropic.messages.create({
-                model: 'claude-3-5-sonnet-20241022',
-                max_tokens: 4000,
-                messages: [
-                  {
-                    role: 'user',
-                    content: reviewPrompt
-                  }
-                ]
-              });
-
-              const reviewComment = response.content[0].text;
-              
-              // GitHubにコメントを投稿
-              await fetch(
-                `https://api.github.com/repos/${process.env.REPO_OWNER}/${process.env.REPO_NAME}/issues/${process.env.PR_NUMBER}/comments`,
-                {
-                  method: 'POST',
-                  headers: {
-                    'Authorization': `token ${process.env.GITHUB_TOKEN}`,
-                    'Accept': 'application/vnd.github.v3+json',
-                    'Content-Type': 'application/json',
-                  },
-                  body: JSON.stringify({
-                    body: `## 🤖 Claude AIレビュー
-
-            ${reviewComment}
-
-            ---
-            *このレビューはClaude AI（Max Plan）により自動生成されました*`
-                  })
-                }
-              );
-
-              console.log('Claude review posted successfully');
-              
-            } catch (error) {
-              console.error('Error in Claude review:', error);
-              process.exit(1);
-            }
-          }
-
-          runClaudeReview();
-          EOF
-
-          # 環境変数として変更ファイルを設定
-          export CHANGED_FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+          echo "🚀 Starting Claude 4 Sonnet review execution..."
           node claude-review.js
+          echo "✅ Claude 4 Sonnet review execution completed"
 
-  # 既存のデプロイジョブ（mainマージ後）
   deploy:
     runs-on: ubuntu-latest
     name: Deploy
-    needs: [test, claude-review]
+    needs: [test, claude-review-and-merge]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     
     steps:
