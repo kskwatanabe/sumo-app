@@ -17,7 +17,7 @@ const rikishi: Rikishi[] = [
   { name: '貴景勝', rank: '大関東', wins: 10, losses: 5 },
   { name: '豊昇龍', rank: '大関西', wins: 9, losses: 6 },
   { name: '大栄翔', rank: '関脇東', wins: 8, losses: 7 },
-  { name: '若元春', rank: '関脇西', wins: 7, losses: 8 }
+  { name: '若元春', rank: '関脇西', wins: 7, losses: 8 },
   { name: '大の里', rank: '横綱西', wins: 11, losses: 4 }
 ]
 
