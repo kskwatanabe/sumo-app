@@ -1,4 +1,4 @@
-name: Claude AI Code Review
+name: Claude AI Auto Review & Merge
 
 on:
   pull_request:
@@ -6,10 +6,11 @@ on:
     branches: [main]
 
 jobs:
-  # 既存のテストジョブ
   test:
     runs-on: ubuntu-latest
     name: Run Tests
+    outputs:
+      test-status: ${{ steps.test-result.outputs.status }}
     steps:
       - uses: actions/checkout@v4
       
@@ -23,19 +24,26 @@ jobs:
         run: npm ci
       
       - name: Run tests
-        run: npm test
+        id: test-result
+        run: |
+          if npm test; then
+            echo "status=passed" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
 
-  # Claude AIレビュージョブ
-  claude-review:
+  claude-review-and-merge:
     runs-on: ubuntu-latest
-    name: Claude AI Review
-    needs: test  # テスト成功後に実行
-    if: github.event_name == 'pull_request'
+    name: Claude AI Review & Auto Merge
+    needs: test
+    if: github.event_name == 'pull_request' && needs.test.outputs.test-status == 'passed'
     
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 全履歴を取得してdiffを正確に
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get changed files
         id: changed-files
@@ -54,132 +62,131 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install review dependencies
+      - name: Install dependencies for review
         run: |
-          npm install @anthropic-ai/sdk node-fetch@3
+          npm init -y
+          npm install @anthropic-ai/sdk
 
-      - name: Run Claude AI Review
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
+      - name: Create review script
         run: |
-          cat > claude-review.js << 'EOF'
+          cat > claude-review.js << 'SCRIPT_EOF'
           const Anthropic = require('@anthropic-ai/sdk');
           const { execSync } = require('child_process');
-          const fetch = require('node-fetch');
+          const https = require('https');
+
+          async function httpRequest(url, options = {}) {
+            return new Promise((resolve, reject) => {
+              const urlObj = new URL(url);
+              const requestOptions = {
+                hostname: urlObj.hostname,
+                port: urlObj.port || 443,
+                path: urlObj.pathname + urlObj.search,
+                method: options.method || 'GET',
+                headers: options.headers || {}
+              };
+
+              const req = https.request(requestOptions, (res) => {
+                let data = '';
+                res.on('data', (chunk) => data += chunk);
+                res.on('end', () => {
+                  try {
+                    const parsed = JSON.parse(data);
+                    resolve(parsed);
+                  } catch (error) {
+                    resolve({ body: data, statusCode: res.statusCode });
+                  }
+                });
+              });
+
+              req.on('error', reject);
+              
+              if (options.body) {
+                req.write(options.body);
+              }
+              
+              req.end();
+            });
+          }
 
           async function runClaudeReview() {
-            const anthropic = new Anthropic({
-              apiKey: process.env.ANTHROPIC_API_KEY,
-            });
-
-            // 変更されたファイルの差分を取得
-            const changedFiles = process.env.CHANGED_FILES?.split(' ') || [];
-            
-            if (changedFiles.length === 0) {
-              console.log('No relevant files changed');
-              return;
-            }
-
-            // Git diffを取得
-            const gitDiff = execSync('git diff origin/main...HEAD', { encoding: 'utf8' });
-            
-            // PRの情報を取得
-            const prResponse = await fetch(
-              `https://api.github.com/repos/${process.env.REPO_OWNER}/${process.env.REPO_NAME}/pulls/${process.env.PR_NUMBER}`,
-              {
-                headers: {
-                  'Authorization': `token ${process.env.GITHUB_TOKEN}`,
-                  'Accept': 'application/vnd.github.v3+json',
-                },
-              }
-            );
-            const prData = await prResponse.json();
-
-            // Claude にレビューを依頼
-            const reviewPrompt = `
-            # コードレビュー依頼
-
-            以下のプルリクエストをレビューしてください。
-
-            ## PR情報
-            - タイトル: ${prData.title}
-            - 説明: ${prData.body || '説明なし'}
-
-            ## 変更内容（Git Diff）
-            \`\`\`diff
-            ${gitDiff}
-            \`\`\`
-
-            ## レビュー観点
-            以下の観点でレビューしてください：
-
-            1. **コード品質**
-               - TypeScript型安全性
-               - エラーハンドリング
-               - パフォーマンス
-               - 可読性・保守性
-
-            2. **アーキテクチャ**
-               - 設計パターンの適用
-               - 責務分離
-               - 拡張性
-
-            3. **テスト**
-               - テストカバレッジ
-               - テストケースの妥当性
-               - エッジケースの考慮
-
-            4. **セキュリティ**
-               - 脆弱性の有無
-               - 入力値検証
-               - 認証・認可
-
-            5. **大相撲アプリ固有**
-               - 力士データの整合性
-               - 番付表示の正確性
-               - 相撲用語の適切な使用
-
-            ## 出力形式
-            以下の形式でレビューコメントを作成してください：
-
-            ### 🎯 総合評価
-            [APPROVE/REQUEST_CHANGES/COMMENT]
-
-            ### ✅ 良い点
-            - [良い実装や改善点を具体的に]
-
-            ### ⚠️ 改善提案
-            - [改善すべき点を具体的に、コード例付きで]
-
-            ### 🐛 潜在的な問題
-            - [バグや脆弱性の可能性があれば]
-
-            ### 📚 学習・参考リソース
-            - [関連するベストプラクティスや参考資料があれば]
-
-            レビューは建設的で、具体的な改善案を含めてください。
-            `;
-
             try {
+              const anthropic = new Anthropic({
+                apiKey: process.env.ANTHROPIC_API_KEY,
+              });
+
+              const changedFiles = process.env.CHANGED_FILES?.split(' ') || [];
+              
+              if (changedFiles.length === 0) {
+                console.log('No relevant files changed');
+                return;
+              }
+
+              const gitDiff = execSync('git diff origin/main...HEAD', { encoding: 'utf8' });
+              
+              const prData = await httpRequest(
+                `https://api.github.com/repos/${process.env.REPO_OWNER}/${process.env.REPO_NAME}/pulls/${process.env.PR_NUMBER}`,
+                {
+                  method: 'GET',
+                  headers: {
+                    'Authorization': `token ${process.env.GITHUB_TOKEN}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                    'User-Agent': 'claude-review-bot'
+                  }
+                }
+              );
+
+              const reviewPrompt = `
+          # コードレビュー依頼
+
+          以下のプルリクエストをレビューしてください。
+
+          ## PR情報
+          - タイトル: ${prData.title || 'No title'}
+          - 説明: ${prData.body || '説明なし'}
+
+          ## 変更内容
+          ${gitDiff.substring(0, 3000)}
+
+          ## レビュー観点
+          1. コード品質
+          2. TypeScript型安全性
+          3. エラーハンドリング
+          4. セキュリティ
+
+          ## 出力形式
+          最初の行に判定を出力：
+          - **DECISION: APPROVE** （自動マージ可能）
+          - **DECISION: REQUEST_CHANGES** （修正必要）
+          - **DECISION: COMMENT** （人間確認必要）
+
+          その後、レビュー内容を記載してください。
+          `;
+
               const response = await anthropic.messages.create({
                 model: 'claude-3-5-sonnet-20241022',
-                max_tokens: 4000,
-                messages: [
-                  {
-                    role: 'user',
-                    content: reviewPrompt
-                  }
-                ]
+                max_tokens: 2000,
+                messages: [{ role: 'user', content: reviewPrompt }]
               });
 
               const reviewComment = response.content[0].text;
+              const lines = reviewComment.split('\n');
+              const decisionLine = lines[0];
               
-              // GitHubにコメントを投稿
-              await fetch(
+              let decision = 'COMMENT';
+              if (decisionLine.includes('DECISION: APPROVE')) {
+                decision = 'APPROVE';
+              } else if (decisionLine.includes('DECISION: REQUEST_CHANGES')) {
+                decision = 'REQUEST_CHANGES';
+              }
+
+              const commentBody = `## 🤖 Claude AIレビュー
+
+          ${reviewComment}
+
+          ---
+          判定: ${decision} | 実行時刻: ${new Date().toISOString()}`;
+
+              await httpRequest(
                 `https://api.github.com/repos/${process.env.REPO_OWNER}/${process.env.REPO_NAME}/issues/${process.env.PR_NUMBER}/comments`,
                 {
                   method: 'POST',
@@ -187,19 +194,13 @@ jobs:
                     'Authorization': `token ${process.env.GITHUB_TOKEN}`,
                     'Accept': 'application/vnd.github.v3+json',
                     'Content-Type': 'application/json',
+                    'User-Agent': 'claude-review-bot'
                   },
-                  body: JSON.stringify({
-                    body: `## 🤖 Claude AIレビュー
-
-            ${reviewComment}
-
-            ---
-            *このレビューはClaude AI（Max Plan）により自動生成されました*`
-                  })
+                  body: JSON.stringify({ body: commentBody })
                 }
               );
 
-              console.log('Claude review posted successfully');
+              console.log(`Review completed with decision: ${decision}`);
               
             } catch (error) {
               console.error('Error in Claude review:', error);
@@ -208,17 +209,22 @@ jobs:
           }
 
           runClaudeReview();
-          EOF
+          SCRIPT_EOF
 
-          # 環境変数として変更ファイルを設定
-          export CHANGED_FILES="${{ steps.changed-files.outputs.all_changed_files }}"
-          node claude-review.js
+      - name: Run Claude AI Review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+        run: node claude-review.js
 
-  # 既存のデプロイジョブ（mainマージ後）
   deploy:
     runs-on: ubuntu-latest
     name: Deploy
-    needs: [test, claude-review]
+    needs: [test, claude-review-and-merge]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     
     steps:
